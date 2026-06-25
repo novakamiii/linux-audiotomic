@@ -34,6 +34,7 @@ original output.
 
 - **`pactl`** — from PipeWire (`pipewire-pulse`) or PulseAudio (`pulseaudio-utils`)
 - **`notify-send`** — from `libnotify` (for desktop notifications)
+- Fish Shell
 
 ### Picker (one required)
 
