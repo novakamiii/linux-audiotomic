@@ -1,35 +1,30 @@
-function audiotomic --description "Route application or desktop audio to a virtual microphone"
-    # Reroutes audio into a virtual mic input visible to recording apps.
-    # Three modes:
-    #   (default)    Pick one or more running apps; their audio becomes the mic
-    #   --desktop    Capture all desktop audio (everything through your speakers)
-    #   --with-mic   Also pipe your real microphone into the virtual input
-    #
-    # The original audio always loops back so you still hear it normally.
-    # Run once to enable (shows picker if needed), run again to disable.
+function audiotomic --description "Route a chosen application's audio to a virtual microphone"
+    # Reroutes one running application's *playback* stream into a virtual mic
+    # input, instead of capturing from a device/source. The app's audio is
+    # also looped back to wherever it was originally playing, so you still
+    # hear it normally while other apps see it as a "microphone".
+    # Run once to enable (shows picker), run again to disable.
     # Deps: pactl (pipewire-pulse) + one of: kdialog wofi rofi fuzzel fzf
+    #
+    # Usage:
+    #   audiotomic                   Route app audio to virtual mic
+    #   audiotomic --with-mic        Also pipe your microphone into the virtual input
+    #   audiotomic -m                Same as --with-mic
 
     # ─── PARSE FLAGS ───────────────────────────────────────────────
     set -l with_mic 0
-    set -l desktop_mode 0
     for arg in $argv
         switch $arg
             case --with-mic -m
                 set with_mic 1
-            case --desktop -d
-                set desktop_mode 1
             case --help -h
-                echo "Usage: audiotomic [--desktop|-d] [--with-mic|-m]"
+                echo "Usage: audiotomic [--with-mic|-m]"
                 echo ""
-                echo "Route audio to a virtual microphone (VirtualMicInput)."
+                echo "Route a playing application's audio to a virtual microphone."
                 echo "Run again to disable."
                 echo ""
-                echo "Modes:"
-                echo "  (default)           Pick one or more apps to route (Application mode)"
-                echo "  --desktop, -d       Capture all desktop audio (Desktop audio mode)"
-                echo ""
                 echo "Flags:"
-                echo "  --with-mic, -m      Also pipe your real microphone into the virtual input"
+                echo "  --with-mic, -m    Also pipe your microphone into the virtual input"
                 return 0
         end
     end
@@ -38,12 +33,14 @@ function audiotomic --description "Route application or desktop audio to a virtu
 
     # ─── TOGGLE OFF ──────────────────────────────────────────────
     if test -f $STATE
+        # Move any rerouted streams back to their original sink first
         for line in (cat $STATE)
             set -l parts (string split ' ' -- $line)
             if test "$parts[1]" = MOVE
                 pactl move-sink-input $parts[2] $parts[3] 2>/dev/null
             end
         end
+        # Then unload modules, most recently loaded first
         for line in (tac $STATE)
             set -l parts (string split ' ' -- $line)
             if test "$parts[1]" = MODULE
@@ -51,111 +48,11 @@ function audiotomic --description "Route application or desktop audio to a virtu
             end
         end
         rm -f $STATE
-        notify-send -i audio-input-microphone "Virtual Mic" "Routing stopped"
+        notify-send -i audio-input-microphone "Virtual Mic" "App routing stopped"
         return 0
     end
 
-    # ─── RESOLVE DEFAULT SINK (needed for Desktop mode and loopback) ──
-    set -l default_sink (pactl info | string match -rg '^Default Sink: (.+)$')
-    if test -z "$default_sink"
-        notify-send -i dialog-error "Virtual Mic" \
-            "Could not detect your default audio output.\nIs PipeWire/PulseAudio running?"
-        return 1
-    end
-
-    # ─── DESKTOP MODE ─────────────────────────────────────────────
-    if test "$desktop_mode" -eq 1
-        set -l state_lines
-
-        # Virtual null sink
-        set -l sink_mid (pactl load-module module-null-sink \
-            sink_name=VirtualMic \
-            'sink_properties=device.description=Virtual Microphone' 2>/dev/null)
-        if test -z "$sink_mid"
-            notify-send -i dialog-error "Virtual Mic" \
-                "Failed to create virtual sink.\nIs PipeWire/PulseAudio running?"
-            return 1
-        end
-        set state_lines $state_lines "MODULE $sink_mid"
-
-        # Loopback: desktop monitor → virtual sink (captures all desktop audio)
-        set -l desktop_loop_mid (pactl load-module module-loopback \
-            source="$default_sink.monitor" \
-            sink=VirtualMic \
-            latency_msec=20 2>/dev/null)
-        if test -z "$desktop_loop_mid"
-            pactl unload-module $sink_mid 2>/dev/null
-            notify-send -i dialog-error "Virtual Mic" \
-                "Failed to loopback desktop audio into virtual sink"
-            return 1
-        end
-        set state_lines $state_lines "MODULE $desktop_loop_mid"
-
-        # Loopback: virtual sink monitor → original output (so you still hear it)
-        set -l hear_loop_mid (pactl load-module module-loopback \
-            source=VirtualMic.monitor \
-            sink=$default_sink \
-            latency_msec=20 2>/dev/null)
-        if test -z "$hear_loop_mid"
-            pactl unload-module $desktop_loop_mid 2>/dev/null
-            pactl unload-module $sink_mid 2>/dev/null
-            notify-send -i dialog-error "Virtual Mic" \
-                "Failed to loop desktop audio back to your speakers"
-            return 1
-        end
-        set state_lines $state_lines "MODULE $hear_loop_mid"
-
-        # Virtual source so it appears as a mic input device
-        set -l vsrc_mid (pactl load-module module-virtual-source \
-            source_name=VirtualMicInput \
-            'source_properties=device.description=Virtual Microphone Input' \
-            master=VirtualMic.monitor 2>/dev/null)
-        if test -z "$vsrc_mid"
-            pactl unload-module $hear_loop_mid 2>/dev/null
-            pactl unload-module $desktop_loop_mid 2>/dev/null
-            pactl unload-module $sink_mid 2>/dev/null
-            notify-send -i dialog-error "Virtual Mic" \
-                "Failed to create virtual source."
-            return 1
-        end
-        set state_lines $state_lines "MODULE $vsrc_mid"
-
-        # Optional: real mic mixed in
-        set -l mic_piped 0
-        if test "$with_mic" -eq 1
-            set -l default_source (pactl info | string match -rg '^Default Source: (.+)$')
-            if test -z "$default_source"
-                notify-send -i dialog-warning "Virtual Mic" \
-                    "Could not detect your microphone.\nPiping only desktop audio."
-            else
-                set -l mic_mid (pactl load-module module-loopback \
-                    source=$default_source \
-                    sink=VirtualMic \
-                    latency_msec=20 2>/dev/null)
-                if test -z "$mic_mid"
-                    notify-send -i dialog-warning "Virtual Mic" \
-                        "Could not pipe mic into virtual input.\nDesktop audio is still routed."
-                else
-                    set state_lines $state_lines "MODULE $mic_mid"
-                    set mic_piped 1
-                end
-            end
-        end
-
-        printf '%s\n' $state_lines > $STATE
-
-        if test "$mic_piped" -eq 1
-            notify-send -i audio-input-microphone "Virtual Mic — Desktop + Mic" \
-                "Capturing: all desktop audio + your microphone\n\nSelect 'VirtualMicInput' as your microphone in recording apps"
-        else
-            notify-send -i audio-input-microphone "Virtual Mic — Desktop Audio" \
-                "Capturing: all desktop audio\n\nSelect 'VirtualMicInput' as your microphone in recording apps"
-        end
-        return 0
-    end
-
-    # ─── APPLICATION MODE ─────────────────────────────────────────
-    # Collect running sink-inputs (playing apps)
+    # ─── COLLECT PLAYING APPLICATIONS (sink-inputs) ──────────────
     set -l si_index
     set -l si_sink
     set -l si_app
@@ -201,7 +98,7 @@ function audiotomic --description "Route application or desktop audio to a virtu
         return 1
     end
 
-    # ─── BUILD DISPLAY LABELS ────────────────────────────────────
+    # ─── DISPLAY ENTRIES ─────────────────────────────────────────
     set -l display_entries
     for i in (seq (count $si_index))
         set -l label $si_app[$i]
@@ -213,91 +110,72 @@ function audiotomic --description "Route application or desktop audio to a virtu
         set display_entries $display_entries "🎵  $label"
     end
 
-    # ─── PICKER (multi-select where supported) ────────────────────
-    # chosen_indices: list of sink-input IDs selected by the user
-    set -l chosen_indices
+    # ─── PICKER ──────────────────────────────────────────────────
+    set -l chosen_index ""
 
     if command -q kdialog
-        # kdialog --checklist supports multi-select; returns space-separated tags
+        # kdialog --menu returns the tag (sink-input index), not the label
         set -l kargs
         for i in (seq (count $si_index))
-            set kargs $kargs $si_index[$i] $display_entries[$i] off
+            set kargs $kargs $si_index[$i] $display_entries[$i]
         end
-        set -l raw (kdialog \
-            --title "Stream Apps to Virtual Mic" \
-            --checklist "Select applications to route as microphone input:" \
+        set chosen_index (kdialog \
+            --title "Stream App to Virtual Mic" \
+            --menu "Select an application whose audio should become microphone input:" \
             $kargs 2>/dev/null)
-        # kdialog wraps each selection in quotes; strip them
-        set chosen_indices (string replace -a '"' '' -- $raw)
     else
-        # Text-based pickers: prompt to pick one entry at a time, loop until done
-        set -l picker ""
+        set -l chosen_display ""
         if command -q wofi
-            set picker wofi
+            set chosen_display (printf '%s\n' $display_entries | \
+                wofi --dmenu --prompt "Stream app to mic:" --insensitive)
         else if command -q rofi
-            set picker rofi
+            set chosen_display (printf '%s\n' $display_entries | \
+                rofi -dmenu -p "Stream app to mic:")
         else if command -q fuzzel
-            set picker fuzzel
+            set chosen_display (printf '%s\n' $display_entries | \
+                fuzzel --dmenu --prompt "Stream app to mic: ")
         else if command -q fzf
-            set picker fzf
+            set chosen_display (printf '%s\n' $display_entries | \
+                fzf --prompt "Stream app to mic: " --reverse --height 40%)
         else
             echo "audiotomic: no picker found — install kdialog, wofi, rofi, fuzzel, or fzf"
             return 1
         end
 
-        # Build a mutable list of remaining entries (we remove picked ones)
-        set -l remaining_indices $si_index
-        set -l remaining_entries $display_entries
-        set -l done_picking 0
-
-        while test "$done_picking" -eq 0; and test (count $remaining_entries) -gt 0
-            # Prepend a "Done" sentinel so the user can finish multi-select
-            set -l menu_entries "✅  Done (route selected)" $remaining_entries
-
-            set -l chosen_display ""
-            switch $picker
-                case wofi
-                    set chosen_display (printf '%s\n' $menu_entries | \
-                        wofi --dmenu --prompt "Add app to mic (pick Done when finished):" --insensitive)
-                case rofi
-                    set chosen_display (printf '%s\n' $menu_entries | \
-                        rofi -dmenu -p "Add app to mic (pick Done when finished):")
-                case fuzzel
-                    set chosen_display (printf '%s\n' $menu_entries | \
-                        fuzzel --dmenu --prompt "Add app to mic (Done when finished): ")
-                case fzf
-                    set chosen_display (printf '%s\n' $menu_entries | \
-                        fzf --prompt "Add app to mic (Done when finished): " --reverse --height 40%)
-            end
-
-            # Cancelled / closed picker without choosing
-            if test -z "$chosen_display"
-                set done_picking 1
+        # Reverse-look up sink-input index from the chosen display string
+        for i in (seq (count $display_entries))
+            if test "$display_entries[$i]" = "$chosen_display"
+                set chosen_index $si_index[$i]
                 break
-            end
-
-            # User chose "Done"
-            if string match -q "✅  Done*" -- "$chosen_display"
-                set done_picking 1
-                break
-            end
-
-            # Match back to a remaining entry
-            for i in (seq (count $remaining_entries))
-                if test "$remaining_entries[$i]" = "$chosen_display"
-                    set chosen_indices $chosen_indices $remaining_indices[$i]
-                    # Remove from remaining so it can't be picked twice
-                    set -e remaining_entries[$i]
-                    set -e remaining_indices[$i]
-                    break
-                end
             end
         end
     end
 
-    # Nothing selected (cancelled)
-    if test (count $chosen_indices) -eq 0
-        return 0
+    test -z "$chosen_index" && return 0  # user cancelled
+
+    # ─── RESOLVE THE APP'S CURRENT SINK (so we can restore it) ───
+    set -l orig_sink_idx ""
+    set -l chosen_label ""
+    for i in (seq (count $si_index))
+        if test "$si_index[$i]" = "$chosen_index"
+            set orig_sink_idx $si_sink[$i]
+            set chosen_label $display_entries[$i]
+            break
+        end
+    end
+
+    set -l orig_sink_name ""
+    for line in (pactl list short sinks)
+        set -l fields (string split \t -- $line)
+        if test "$fields[1]" = "$orig_sink_idx"
+            set orig_sink_name $fields[2]
+            break
+        end
+    end
+
+    if test -z "$orig_sink_name"
+        notify-send -i dialog-error "Virtual Mic" "Couldn't resolve the app's current output device"
+        return 1
     end
 
     # ─── CREATE VIRTUAL SINK ─────────────────────────────────────
@@ -306,6 +184,7 @@ function audiotomic --description "Route application or desktop audio to a virtu
     set -l sink_mid (pactl load-module module-null-sink \
         sink_name=VirtualMic \
         'sink_properties=device.description=Virtual Microphone' 2>/dev/null)
+
     if test -z "$sink_mid"
         notify-send -i dialog-error "Virtual Mic" \
             "Failed to create virtual sink.\nIs PipeWire/PulseAudio running?"
@@ -313,86 +192,46 @@ function audiotomic --description "Route application or desktop audio to a virtu
     end
     set state_lines $state_lines "MODULE $sink_mid"
 
-    # ─── ROUTE EACH CHOSEN APP ───────────────────────────────────
-    set -l routed_labels
-    set -l failed_labels
-
-    for chosen_index in $chosen_indices
-        # Find original sink and label for this stream
-        set -l orig_sink_idx ""
-        set -l chosen_label ""
-        for i in (seq (count $si_index))
-            if test "$si_index[$i]" = "$chosen_index"
-                set orig_sink_idx $si_sink[$i]
-                set chosen_label $display_entries[$i]
-                break
-            end
-        end
-
-        # Resolve numeric sink index → name
-        set -l orig_sink_name ""
-        for line in (pactl list short sinks)
-            set -l fields (string split \t -- $line)
-            if test "$fields[1]" = "$orig_sink_idx"
-                set orig_sink_name $fields[2]
-                break
-            end
-        end
-
-        if test -z "$orig_sink_name"
-            set failed_labels $failed_labels $chosen_label
-            continue
-        end
-
-        # Move stream to virtual sink
-        if not pactl move-sink-input $chosen_index VirtualMic 2>/dev/null
-            set failed_labels $failed_labels $chosen_label
-            continue
-        end
-        set state_lines $state_lines "MOVE $chosen_index $orig_sink_name"
-
-        # Loopback: virtual sink → original output (so you still hear the app)
-        set -l loop_mid (pactl load-module module-loopback \
-            source=VirtualMic.monitor \
-            sink=$orig_sink_name \
-            latency_msec=20 2>/dev/null)
-        if test -n "$loop_mid"
-            set state_lines $state_lines "MODULE $loop_mid"
-        end
-
-        set routed_labels $routed_labels $chosen_label
-    end
-
-    # Nothing routed successfully — clean up and abort
-    if test (count $routed_labels) -eq 0
-        for line in (tac $state_lines)
-            set -l parts (string split ' ' -- $line)
-            if test "$parts[1]" = MOVE
-                pactl move-sink-input $parts[2] $parts[3] 2>/dev/null
-            else if test "$parts[1]" = MODULE
-                pactl unload-module $parts[2] 2>/dev/null
-            end
-        end
+    # ─── REROUTE THE APP'S STREAM INTO IT ────────────────────────
+    if not pactl move-sink-input $chosen_index VirtualMic 2>/dev/null
+        pactl unload-module $sink_mid 2>/dev/null
         notify-send -i dialog-error "Virtual Mic" \
-            "Failed to reroute audio for any selected application"
+            "Failed to reroute audio for:\n$chosen_label"
         return 1
     end
+    set state_lines $state_lines "MOVE $chosen_index $orig_sink_name"
 
-    # ─── VIRTUAL SOURCE (appears as a mic input device) ──────────
+    # ─── LOOP BACK TO THE ORIGINAL OUTPUT SO YOU STILL HEAR IT ───
+    set -l loop_mid (pactl load-module module-loopback \
+        source=VirtualMic.monitor \
+        sink=$orig_sink_name \
+        latency_msec=20 2>/dev/null)
+
+    if test -z "$loop_mid"
+        pactl move-sink-input $chosen_index $orig_sink_name 2>/dev/null
+        pactl unload-module $sink_mid 2>/dev/null
+        notify-send -i dialog-error "Virtual Mic" \
+            "Failed to loop audio back to your speakers"
+        return 1
+    end
+    set state_lines $state_lines "MODULE $loop_mid"
+
+    # ─── CREATE A VIRTUAL SOURCE so it shows up as an Input Device ──
     set -l vsrc_mid (pactl load-module module-virtual-source \
         source_name=VirtualMicInput \
-        'source_properties=device.description=Virtual Microphone Input' \
         master=VirtualMic.monitor 2>/dev/null)
 
     if test -z "$vsrc_mid"
-        # Non-fatal: audio still routes, just won't appear as a nice source name
-        notify-send -i dialog-warning "Virtual Mic" \
-            "Virtual source creation failed.\nUse 'VirtualMic.monitor' as microphone instead."
-    else
-        set state_lines $state_lines "MODULE $vsrc_mid"
+        pactl unload-module $loop_mid 2>/dev/null
+        pactl move-sink-input $chosen_index $orig_sink_name 2>/dev/null
+        pactl unload-module $sink_mid 2>/dev/null
+        notify-send -i dialog-error "Virtual Mic" \
+            "Failed to create virtual source.\nYour audio still plays, but no mic input was created."
+        return 1
     end
+    set state_lines $state_lines "MODULE $vsrc_mid"
 
-    # ─── OPTIONAL: MIX IN REAL MICROPHONE ────────────────────────
+    # ─── OPTIONAL: PIPE MICROPHONE INTO THE VIRTUAL SINK ─────────
     set -l mic_piped 0
     if test "$with_mic" -eq 1
         set -l default_source (pactl info | string match -rg '^Default Source: (.+)$')
@@ -417,19 +256,11 @@ function audiotomic --description "Route application or desktop audio to a virtu
     printf '%s\n' $state_lines > $STATE
 
     # ─── NOTIFY ──────────────────────────────────────────────────
-    set -l routed_list (string join "\n  • " $routed_labels)
-    set -l notice "Routing:\n  • $routed_list"
-
-    if test (count $failed_labels) -gt 0
-        set -l failed_list (string join ", " $failed_labels)
-        set notice "$notice\n\n⚠ Failed to route: $failed_list"
-    end
-
     if test "$mic_piped" -eq 1
-        set notice "$notice\n  • Your microphone"
+        notify-send -i audio-input-microphone "Virtual Mic (with mic)" \
+            "Routing: $chosen_label + your mic\n\nIn your app, select 'VirtualMicInput' as microphone"
+    else
+        notify-send -i audio-input-microphone "Virtual Mic" \
+            "Routing: $chosen_label\n\nIn your app, select 'VirtualMicInput' as microphone"
     end
-
-    set notice "$notice\n\nSelect 'VirtualMicInput' as your microphone in recording apps"
-
-    notify-send -i audio-input-microphone "Virtual Mic — Application Audio" $notice
 end
